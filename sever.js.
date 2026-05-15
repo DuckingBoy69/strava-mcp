@@ -1,0 +1,285 @@
+import express from 'express';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { z } from 'zod';
+import { randomUUID } from 'crypto';
+
+// ─── Token Management ────────────────────────────────────────────────────────
+
+let tokenData = {
+  access_token: process.env.STRAVA_ACCESS_TOKEN || '',
+  refresh_token: process.env.STRAVA_REFRESH_TOKEN || '',
+  expires_at: parseInt(process.env.STRAVA_EXPIRES_AT || '0'),
+};
+
+async function refreshAccessToken() {
+  const res = await fetch('https://www.strava.com/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      client_id: process.env.STRAVA_CLIENT_ID,
+      client_secret: process.env.STRAVA_CLIENT_SECRET,
+      grant_type: 'refresh_token',
+      refresh_token: tokenData.refresh_token,
+    }),
+  });
+  const data = await res.json();
+  if (!data.access_token) throw new Error('Token refresh failed: ' + JSON.stringify(data));
+  tokenData = {
+    access_token: data.access_token,
+    refresh_token: data.refresh_token,
+    expires_at: data.expires_at,
+  };
+  console.log('🔄 Strava token refreshed');
+  return tokenData.access_token;
+}
+
+async function getAccessToken() {
+  if (Date.now() / 1000 > tokenData.expires_at - 60) {
+    return await refreshAccessToken();
+  }
+  return tokenData.access_token;
+}
+
+async function stravaFetch(endpoint, params = {}) {
+  const token = await getAccessToken();
+  const url = new URL(`https://www.strava.com/api/v3${endpoint}`);
+  Object.entries(params).forEach(([k, v]) => {
+    if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
+  });
+  const res = await fetch(url.toString(), {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Strava API ${res.status}: ${err}`);
+  }
+  return res.json();
+}
+
+// ─── MCP Server Factory ───────────────────────────────────────────────────────
+
+function createMcpServer() {
+  const server = new McpServer({ name: 'strava-mcp', version: '1.0.0' });
+
+  server.tool('get_athlete', 'Get your Strava athlete profile — name, location, FTP, weight.', {}, async () => {
+    const data = await stravaFetch('/athlete');
+    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+  });
+
+  server.tool(
+    'get_recent_activities',
+    'List your recent Strava activities with distance, time, pace, elevation and heart rate.',
+    {
+      per_page: z.number().min(1).max(100).optional().describe('Number of activities (default 30)'),
+      page: z.number().optional().describe('Page number (default 1)'),
+      after: z.number().optional().describe('Only activities after this Unix timestamp'),
+      before: z.number().optional().describe('Only activities before this Unix timestamp'),
+    },
+    async ({ per_page, page, after, before }) => {
+      const data = await stravaFetch('/athlete/activities', {
+        per_page: per_page ?? 30,
+        page: page ?? 1,
+        after,
+        before,
+      });
+      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  server.tool(
+    'get_activity',
+    'Get full details of a specific activity — splits, gear, kudos, segment efforts.',
+    { id: z.string().describe('Strava activity ID') },
+    async ({ id }) => {
+      const data = await stravaFetch(`/activities/${id}`, { include_all_efforts: true });
+      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  server.tool('get_athlete_stats', 'Get all-time, year-to-date, and recent 4-week totals for runs, rides, and swims.', {}, async () => {
+    const athlete = await stravaFetch('/athlete');
+    const data = await stravaFetch(`/athletes/${athlete.id}/stats`);
+    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+  });
+
+  server.tool(
+    'get_activity_zones',
+    'Get heart rate and power zone distribution for an activity.',
+    { id: z.string().describe('Strava activity ID') },
+    async ({ id }) => {
+      const data = await stravaFetch(`/activities/${id}/zones`);
+      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  server.tool(
+    'get_activity_laps',
+    'Get lap-by-lap breakdown — pace, HR, elapsed time.',
+    { id: z.string().describe('Strava activity ID') },
+    async ({ id }) => {
+      const data = await stravaFetch(`/activities/${id}/laps`);
+      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  server.tool(
+    'get_activity_kudoers',
+    'See who gave kudos on an activity.',
+    { id: z.string().describe('Strava activity ID') },
+    async ({ id }) => {
+      const data = await stravaFetch(`/activities/${id}/kudos`);
+      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  server.tool('get_starred_segments', 'Get your starred Strava segments with PR times.', {}, async () => {
+    const data = await stravaFetch('/segments/starred');
+    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+  });
+
+  server.tool(
+    'get_segment_leaderboard',
+    'Get the leaderboard for a segment — your rank vs others.',
+    { id: z.string().describe('Strava segment ID') },
+    async ({ id }) => {
+      const data = await stravaFetch(`/segments/${id}/leaderboard`);
+      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  server.tool(
+    'get_gear',
+    'Get details about a bike or pair of shoes — total distance logged.',
+    { id: z.string().describe('Gear ID (e.g. g123456 for bike, a123456 for shoes)') },
+    async ({ id }) => {
+      const data = await stravaFetch(`/gear/${id}`);
+      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  return server;
+}
+
+// ─── Express App ─────────────────────────────────────────────────────────────
+
+const app = express();
+app.use(express.json());
+
+const transports = new Map();
+
+// MCP endpoint (StreamableHTTP — required by Claude.ai)
+app.post('/mcp', async (req, res) => {
+  try {
+    const sessionId = req.headers['mcp-session-id'] || randomUUID();
+    let transport = transports.get(sessionId);
+
+    if (!transport) {
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => sessionId,
+      });
+      const server = createMcpServer();
+      await server.connect(transport);
+      transports.set(sessionId, transport);
+      transport.onclose = () => transports.delete(sessionId);
+    }
+
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    console.error('MCP error:', err);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/mcp', async (req, res) => {
+  const sessionId = req.headers['mcp-session-id'];
+  const transport = transports.get(sessionId);
+  if (!transport) return res.status(404).json({ error: 'Session not found' });
+  await transport.handleRequest(req, res);
+});
+
+app.delete('/mcp', async (req, res) => {
+  const sessionId = req.headers['mcp-session-id'];
+  const transport = transports.get(sessionId);
+  if (transport) {
+    await transport.close();
+    transports.delete(sessionId);
+  }
+  res.status(204).send();
+});
+
+// ─── OAuth Flow ───────────────────────────────────────────────────────────────
+
+app.get('/', (req, res) => {
+  const connected = !!tokenData.access_token;
+  res.send(`
+    <html><body style="font-family:sans-serif;max-width:600px;margin:60px auto;padding:0 20px">
+      <h1>🚴 Strava MCP Server</h1>
+      <p>Status: <strong style="color:green">Running</strong></p>
+      ${connected
+        ? '<p>✅ Strava is connected.</p>'
+        : '<p>⚠️ Not connected yet. <a href="/auth">Connect Strava →</a></p>'}
+      <hr>
+      <p>MCP URL for Claude:</p>
+      <code>${process.env.PUBLIC_URL || 'https://your-app.railway.app'}/mcp</code>
+    </body></html>
+  `);
+});
+
+app.get('/auth', (req, res) => {
+  const redirectUri = `${process.env.PUBLIC_URL}/callback`;
+  const authUrl =
+    `https://www.strava.com/oauth/authorize` +
+    `?client_id=${process.env.STRAVA_CLIENT_ID}` +
+    `&response_type=code` +
+    `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+    `&scope=read,activity:read_all,profile:read_all`;
+  res.redirect(authUrl);
+});
+
+app.get('/callback', async (req, res) => {
+  const { code, error } = req.query;
+  if (error) return res.send(`<h2>Error: ${error}</h2>`);
+
+  const tokenRes = await fetch('https://www.strava.com/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      client_id: process.env.STRAVA_CLIENT_ID,
+      client_secret: process.env.STRAVA_CLIENT_SECRET,
+      code,
+      grant_type: 'authorization_code',
+    }),
+  });
+  const data = await tokenRes.json();
+
+  if (!data.access_token) {
+    return res.send(`<h2>Error exchanging code</h2><pre>${JSON.stringify(data, null, 2)}</pre>`);
+  }
+
+  tokenData = {
+    access_token: data.access_token,
+    refresh_token: data.refresh_token,
+    expires_at: data.expires_at,
+  };
+
+  res.send(`
+    <html><body style="font-family:sans-serif;max-width:600px;margin:60px auto;padding:0 20px">
+      <h1>✅ Strava Connected!</h1>
+      <p>Welcome, <strong>${data.athlete?.firstname} ${data.athlete?.lastname}</strong>!</p>
+      <p>Add these to your Railway environment variables:</p>
+      <pre style="background:#f4f4f4;padding:16px;border-radius:8px;word-break:break-all">STRAVA_ACCESS_TOKEN=${data.access_token}
+STRAVA_REFRESH_TOKEN=${data.refresh_token}
+STRAVA_EXPIRES_AT=${data.expires_at}</pre>
+      <p><a href="/">← Back to home</a></p>
+    </body></html>
+  `);
+});
+
+// ─── Start ───────────────────────────────────────────────────────────────────
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`✅ Strava MCP server running on port ${PORT}`);
+  console.log(`   MCP URL: ${process.env.PUBLIC_URL || 'http://localhost:' + PORT}/mcp`);
+});
